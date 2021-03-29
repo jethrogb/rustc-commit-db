@@ -13,6 +13,7 @@
 require 'json'
 require 'net/https'
 require 'aws-sdk-s3'
+require 'date'
 
 Dir.chdir(File.dirname(__FILE__))
 
@@ -216,43 +217,48 @@ class DistCache
 	def update(force)
 		$stderr.puts "Checking for release updates on #{@channel}"
 
-		client = Aws::S3::Client.new(endpoint: 'https://static.rust-lang.org', region: 'none')
-		client.list_objects_v2(bucket: '', prefix: 'dist/')
+		client = Aws::S3::Client.new(region: 'us-west-1')
 
 		tomls = []
 		if @channel=="stable" then
 			start_after = 'dist/channel-rust'
 			break_re = '^dist/channel-rust'
 			toml_re = '^dist/(channel-rust-\\d+\\.\\d+\\.\\d+\\.toml)$'
+
+			for obj in client.list_objects_v2(bucket: 'static-rust-lang-org', prefix: 'dist/', start_after: start_after)
+						.each_page.lazy.flat_map { |page| page.data.contents }
+				break unless obj.key =~ Regexp.new(break_re)
+				tomls << $~[1] if obj.key =~ Regexp.new(toml_re)
+			end
 		else
 			latest =~ Regexp.new("^#{@channel}-(\\d{4}-\\d{2}-\\d{2})$")
 
 			if force then
-				start_after = 'dist/2000-01-01'
+				start_after = '2000-01-01'
 			else
-				start_after = "dist/#{$~[1]}"
+				start_after = "#{$~[1]}"
 			end
-			break_re = '^dist/\\d{4}-\\d{2}-\\d{2}/'
-			toml_re = "^dist/(\\d{4}-\\d{2}-\\d{2}/channel-rust-#{@channel}\\.toml)$"
-		end
-		for obj in client.list_objects_v2(bucket: '', prefix: 'dist/', start_after: start_after)
-					.each_page.lazy.flat_map { |page| page.data.contents }
-			break unless obj.key =~ Regexp.new(break_re)
-			tomls << $~[1] if obj.key =~ Regexp.new(toml_re)
+
+			for date in Date::strptime(start_after)..Date::today
+				tomls << "#{date}/channel-rust-#{@channel}.toml"
+			end
 		end
 
 		count=0
 		tomls.each do |toml|
 			f="#{cache_dir}/#{toml}"
 			if not File.exists?(f) then
-				count+=1
 				begin
-					Dir.mkdir(File.dirname(f))
-				rescue Errno::EEXIST
+					resp = client.get_object(bucket: 'static-rust-lang-org', key: "dist/#{toml}", request_payer: "requester")
+					data = resp.body.read
+					count+=1
+					begin
+						Dir.mkdir(File.dirname(f))
+					rescue Errno::EEXIST
+					end
+					IO.write(f, data)
+				rescue Aws::S3::Errors::NoSuchKey
 				end
-				data=Net::HTTP.get(URI("#{url_base}/#{toml}"))
-				raise IOError, "Unable to obtain release info" if data.nil?
-				IO.write(f,data)
 			end
 		end
 		$stderr.puts "Retrieved #{count} new releases"
